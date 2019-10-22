@@ -1,0 +1,103 @@
+
+
+    # Example configuration of domains protected by Authelia.
+    server {
+        listen 8080 ssl; 
+        server_name     public.example.com
+                        admin.example.com
+                        secure.example.com
+                        dev.example.com
+                        singlefactor.example.com
+                        mx1.mail.example.com mx2.mail.example.com;
+
+        resolver 127.0.0.11 ipv6=off;
+        set $upstream_verify <%= authelia_backend %>/api/verify;
+        set $upstream_endpoint http://nginx-backend;
+        set $upstream_headers http://httpbin:8000/headers;
+
+        ssl_certificate     /etc/ssl/server.crt;
+        ssl_certificate_key /etc/ssl/server.key;
+
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Frame-Options "SAMEORIGIN";
+
+        # Reverse proxy to the backend. It is protected by Authelia by forwarding authorization checks
+        # to the virtual endpoint introduced by nginx and declared in the next block.
+        location / {
+            auth_request /auth_verify;
+            
+            auth_request_set $user      $upstream_http_remote_user;
+            proxy_set_header            X-Forwarded-User $user;
+            
+            auth_request_set            $groups $upstream_http_remote_groups;
+            proxy_set_header            Remote-Groups $groups;
+
+            # Route the request to the correct virtual host in the backend.
+            proxy_set_header            Host $http_host;
+
+            # Authelia relies on Proxy-Authorization header to authenticate in basic auth.
+            # but for the sake of simplicity (because Authorization in supported in most
+            # clients) we take Authorization from the frontend and rewrite it to
+            # Proxy-Authorization before sending it to Authelia.
+            proxy_set_header            Proxy-Authorization $http_authorization;
+
+            # mitigate HTTPoxy Vulnerability
+            # https://www.nginx.com/blog/mitigating-the-httpoxy-vulnerability-with-nginx/
+            proxy_set_header            Proxy "";
+
+            # Set the `target_url` variable based on the request. It will be used to build the portal
+            # URL with the correct redirection parameter.
+            set                         $target_url $scheme://$http_host$request_uri;
+            error_page 401 =302         https://login.example.com:8080/#/?rd=$target_url;
+
+            proxy_pass                  $upstream_endpoint;
+        }
+
+        # Virtual endpoint forwarding requests to Authelia server.
+        location /auth_verify {
+            internal;
+            proxy_set_header            X-Real-IP $remote_addr;
+
+            # Provide either X-Original-URL and X-Forwarded-Proto or
+            # X-Forwarded-Proto, X-Forwarded-Host and X-Forwarded-Uri or both.
+            # Those headers will be used by Authelia to deduce the target url of the user.
+            #
+            # X-Forwarded-Proto is mandatory since Authelia uses the "trust proxy" option.
+            # See https://expressjs.com/en/guide/behind-proxies.html
+            proxy_set_header            X-Original-URL $scheme://$https_host$request_uri;
+
+            proxy_set_header            X-Forwarded-Proto $scheme;
+            proxy_set_header            X-Forwarded-Host $http_host;
+            proxy_set_header            X-Forwarded-Uri $request_uri;
+            
+            proxy_set_header            X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            # Authelia can receive Proxy-Authorization to authenticate however most of the clients
+            # support Authorization instead. Therefore we rewrite Authorization into Proxy-Authorization.
+            proxy_set_header            Proxy-Authorization $http_authorization;
+
+            proxy_pass_request_body     off;
+            proxy_set_header            Content-Length "";
+
+            proxy_pass                  $upstream_verify;
+        }
+
+        # Used by suites to test the forwarded users and groups headers produced by Authelia.
+        location /headers {
+            auth_request /auth_verify;
+
+            auth_request_set            $user $upstream_http_remote_user;
+            proxy_set_header            Custom-Forwarded-User $user;
+            
+            auth_request_set            $groups $upstream_http_remote_groups;
+            proxy_set_header            Custom-Forwarded-Groups $groups;
+
+            set                         $target_url $scheme://$http_host$request_uri;
+            error_page 401 =302         https://login.example.com:8080/#/?rd=$target_url;
+
+            proxy_pass                  $upstream_headers;
+        }
+    }
+
+}
+
